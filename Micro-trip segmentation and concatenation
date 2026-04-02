@@ -1,0 +1,266 @@
+import pandas as pd
+import gspread
+from google.colab import auth
+from google.auth import default
+from gspread_dataframe import get_as_dataframe
+
+# Authenticate Google account
+auth.authenticate_user()
+creds, _ = default()
+gc = gspread.authorize(creds)
+
+spreadsheet = gc.open_by_url(sheet_url)
+worksheet = gc.open("HDV_Emission").sheet1  # opens first sheet
+
+# Convert worksheet to pandas DataFrame
+df = get_as_dataframe(worksheet)
+# Show the first few rows
+df.head()
+
+# ================== CONFIG ==================
+FS = 1.0                 # Hz (samples per second)
+TARGET_CYCLE_SEC = 1200  # 20 min per cycle
+STOP_KMH = 3.5           # stop threshold
+MIN_STOP_SEC = 2         # min consecutive stop seconds to define microtrip boundaries
+IDLE_GAP_SEC = 3         # seconds of idle inserted between microtrips
+SPEED_CAP = 40.5         # km/h (your stated max)
+SMOOTH_WIN = 5           # Savitzky-Golay window (odd); set 0 to disable
+SMOOTH_POLY = 2
+COLS = {"HHD": "SPEED_HHD", "MHD": "SPEED_MHD", "LHD": "SPEED_LHD"}
+# ============================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def load_series_from_df(df, col):
+    s = df[col].astype(float).copy()
+    s = s.clip(lower=0, upper=SPEED_CAP)  # clean & cap
+    s = s.interpolate(limit_direction="both")  # fill small gaps if any
+    s.index = pd.RangeIndex(len(s))
+    if SMOOTH_WIN and SMOOTH_WIN % 2 == 1 and len(s) >= SMOOTH_WIN:
+        from scipy.signal import savgol_filter
+        s[:] = savgol_filter(s, SMOOTH_WIN, SMOOTH_POLY)
+        s[:] = np.clip(s, 0, SPEED_CAP)
+    return s
+
+def derive_accel(speed_kmh, fs=1.0):
+    v = speed_kmh.values * (1000/3600)
+    a = np.gradient(v, 1.0/fs)
+    return pd.Series(a, index=speed_kmh.index)
+
+def segment_microtrips(speed_kmh, stop_kmh=1.0, min_stop_sec=2, fs=1.0):
+    stop = (speed_kmh < stop_kmh).astype(int)
+    runs = (stop.diff().fillna(0) != 0).cumsum()
+    spans = []
+    for k, g in speed_kmh.groupby(runs):
+        idx = g.index
+        if (speed_kmh.loc[idx] < stop_kmh).all() and (idx[-1] - idx[0] + 1) >= int(min_stop_sec*fs):
+            spans.append((idx[0], idx[-1]))
+    if not spans:
+        return [(0, len(speed_kmh)-1)]
+    bounds = sorted({sp[0] for sp in spans} | {spans[-1][1]})
+    trips = []
+    for i in range(len(bounds)-1):
+        s, e = bounds[i], bounds[i+1]
+        if e - s >= 3:  # skip ultra-short
+            trips.append((s, e))
+    return trips or [(0, len(speed_kmh)-1)]
+
+def pke(v_ms):
+    dv = np.diff(v_ms)
+    dv_pos = np.clip(dv, 0, None)
+    return float(np.sum(dv_pos**2))
+
+def microtrip_features(speed_kmh, fs=1.0):
+    acc = derive_accel(speed_kmh, fs)
+    vms = speed_kmh*(1000/3600)
+    return {
+        "dur_s": len(speed_kmh)/fs,
+        "mean_kmh": float(speed_kmh.mean()),
+        "max_kmh": float(speed_kmh.max()),
+        "pke": pke(vms.values),
+        "pct_idle": float((speed_kmh.lt(1.0).mean())*100),
+        "pct_acc": float((acc.gt(0.1).mean())*100),
+        "pct_dec": float((acc.lt(-0.1).mean())*100),
+    }
+
+def build_microtrip_df(speed_kmh, fs=1.0, stop_kmh=1.0, min_stop_sec=2):
+    trips = segment_microtrips(speed_kmh, stop_kmh, min_stop_sec, fs)
+    rows = []
+    for s, e in trips:
+        seg = speed_kmh.loc[s:e]
+        f = microtrip_features(seg, fs)
+        f.update({"i_start": int(s), "i_end": int(e)})
+        rows.append(f)
+    return pd.DataFrame(rows)
+
+def make_cycle(speed_kmh, target_len_s=1200, fs=1.0, idle_gap_s=3):
+    mdf = build_microtrip_df(speed_kmh, fs, STOP_KMH, MIN_STOP_SEC)
+    if mdf.empty:
+        raise ValueError("No microtrips found; relax STOP_KMH/MIN_STOP_SEC.")
+    # stratify by mean speed & PKE
+    mdf["bin_v"] = pd.qcut(mdf["mean_kmh"], q=5, duplicates="drop")
+    mdf["bin_pke"] = pd.qcut(mdf["pke"], q=5, duplicates="drop")
+    strata = {k: g.sample(frac=1.0, random_state=42).reset_index(drop=True)
+              for k, g in mdf.groupby(["bin_v","bin_pke"])}
+    ptr = {k: 0 for k in strata}
+    chosen, total = [], 0.0
+    while total < target_len_s and strata:
+        for k in list(strata.keys()):
+            g = strata[k]; i = ptr[k]
+            if i >= len(g):
+                del strata[k]; continue
+            row = g.loc[i]; chosen.append(row)
+            total += row["dur_s"] + idle_gap_s
+            ptr[k] += 1
+            if total >= target_len_s: break
+    sel = pd.DataFrame(chosen)
+    # stitch
+    seq = []
+    for _, r in sel.iterrows():
+        seg = speed_kmh.loc[int(r["i_start"]):int(r["i_end"])].values
+        seq.append(seg)
+        seq.append(np.zeros(int(idle_gap_s*fs)))
+    v_cycle = np.concatenate(seq)[:int(target_len_s*fs)]
+    cycle_df = pd.DataFrame({"time_s": np.arange(len(v_cycle))/fs, "speed_kmh": v_cycle})
+    return cycle_df, mdf, sel
+
+# --- Build cycles for all three classes directly from df ---
+spd = {cls: load_series_from_df(df, col) for cls, col in COLS.items()}
+cyc = {}
+feats = {}
+sel = {}
+for cls in ["HHD","MHD","LHD"]:
+    cyc[cls], feats[cls], sel[cls] = make_cycle(spd[cls], TARGET_CYCLE_SEC, FS, IDLE_GAP_SEC)
+
+# --- Quick paper-ready plots ---
+def plot_cycle(cyc_df, title):
+    plt.figure(figsize=(6.5,2.6))
+    plt.plot(cyc_df["time_s"], cyc_df["speed_kmh"], linewidth=1.0)
+    plt.xlabel("Time (s)", fontweight="bold")
+    plt.ylabel("Speed (km/h)", fontweight="bold")
+    plt.title(title, fontweight="bold")
+    plt.tight_layout(); plt.show()
+
+plot_cycle(cyc["HHD"], "HHD Representative Driving Cycle")
+plot_cycle(cyc["MHD"], "MHD Representative Driving Cycle")
+plot_cycle(cyc["LHD"], "LHD Representative Driving Cycle")
+
+# Compare distributions (orig vs cycle) — speed
+def compare_speed_pdf(orig, cyc_df, label):
+    plt.figure(figsize=(5.8,2.6))
+    sns.histplot(orig, stat="percent", bins=30, color="gray", alpha=0.7, label="Original")
+    sns.histplot(cyc_df["speed_kmh"], stat="percent", bins=30, color="C0", alpha=0.6, label="Cycle")
+    plt.xlabel("Speed (km/h)", fontweight="bold"); plt.ylabel("Percent", fontweight="bold")
+    plt.title(f"Speed distribution — {label}", fontweight="bold")
+    plt.legend(); plt.tight_layout(); plt.show()
+
+for cls in ["HHD","MHD","LHD"]:
+    compare_speed_pdf(spd[cls], cyc[cls], cls)
+
+# --- Export cycles ---
+cyc["HHD"].to_csv("cycle_HHD.csv", index=False)
+cyc["MHD"].to_csv("cycle_MHD.csv", index=False)
+cyc["LHD"].to_csv("cycle_LHD.csv", index=False)
+print("Saved: cycle_HHD.csv, cycle_MHD.csv, cycle_LHD.csv")
+
+print("HHD microtrips:", len(feats["HHD"]))
+print("MHD microtrips:", len(feats["MHD"]))
+print("LHD microtrips:", len(feats["LHD"]))
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# Add a class column to each cycle before merging
+cyc["HHD"]["CLASS"] = "HHD"
+cyc["MHD"]["CLASS"] = "MHD"
+cyc["LHD"]["CLASS"] = "LHD"
+
+# Concatenate all cycles
+all_cycles = pd.concat([cyc["HHD"], cyc["MHD"], cyc["LHD"]], ignore_index=True)
+
+# Save to single CSV
+all_cycles.to_csv("all_driving_cycles.csv", index=False)
+print("Saved: all_driving_cycles.csv")
+
+# Merge cycles into one file
+cyc["HHD"]["CLASS"] = "HHD"
+cyc["MHD"]["CLASS"] = "MHD"
+cyc["LHD"]["CLASS"] = "LHD"
+
+all_cycles = pd.concat([cyc["HHD"], cyc["MHD"], cyc["LHD"]], ignore_index=True)
+all_cycles.to_csv("all_driving_cycles.csv", index=False)
+
+# Download to local machine
+from google.colab import files
+files.download("all_driving_cycles.csv")
+
+sns.set_palette("colorblind")  # readable & color-blind friendly
+
+plt.xlabel("Time (s)", fontweight="bold")
+plt.ylabel("Speed (km/h)", fontweight="bold")
+plt.title("Representative Driving Cycles (HHD/MHD/LHD)", fontweight="bold")
+plt.legend(ncol=3, frameon=False)   # compact legend
+plt.ylim(0, 41)                      # your cap ~40.5 km/h
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set_palette("colorblind"). # same HDV classes for all the segments
+
+fig, axes = plt.subplots(3, 1, figsize=(7,4.8), sharex=True, sharey=True)
+
+axes[0].plot(cyc["HHD"]["time_s"], cyc["HHD"]["speed_kmh"], linewidth=1.1)
+axes[0].set_title("HHD", fontweight="bold")
+axes[0].set_ylabel("Speed (km/h)", fontweight="bold")
+
+axes[1].plot(cyc["MHD"]["time_s"], cyc["MHD"]["speed_kmh"], linewidth=1.1)
+axes[1].set_title("MHD", fontweight="bold")
+axes[1].set_ylabel("Speed (km/h)", fontweight="bold")
+
+axes[2].plot(cyc["LHD"]["time_s"], cyc["LHD"]["speed_kmh"], linewidth=1.1)
+axes[2].set_title("LHD", fontweight="bold")
+axes[2].set_ylabel("Speed (km/h)", fontweight="bold")
+axes[2].set_xlabel("Time (s)", fontweight="bold")
+
+for ax in axes:
+    ax.set_ylim(0, 41)   # same y limits for visual comparability
+    ax.grid(alpha=0.2)
+
+plt.tight_layout()
+
+sns.set_palette("colorblind").
+
+fig, axes = plt.subplots(3, 1, figsize=(5,4.8), sharex=True, sharey=True)
+
+axes[0].plot(cyc["HHD"]["time_s"], cyc["HHD"]["speed_kmh"], linewidth=1.1)
+axes[0].set_title("HHD", fontweight="bold")
+axes[0].set_ylabel("Speed (km/h)", fontweight="bold")
+
+axes[1].plot(cyc["MHD"]["time_s"], cyc["MHD"]["speed_kmh"], linewidth=1.1)
+axes[1].set_title("MHD", fontweight="bold")
+axes[1].set_ylabel("Speed (km/h)", fontweight="bold")
+
+axes[2].plot(cyc["LHD"]["time_s"], cyc["LHD"]["speed_kmh"], linewidth=1.1)
+axes[2].set_title("LHD", fontweight="bold")
+axes[2].set_ylabel("Speed (km/h)", fontweight="bold")
+axes[2].set_xlabel("Time (s)", fontweight="bold")
+
+for ax in axes:
+    ax.set_ylim(0, 41)   # same y limits for visual comparability
+    ax.grid(alpha=0.2)
+
+# Compare distributions (orig vs cycle) — speed
+def compare_speed_pdf(orig, cyc_df, label):
+    plt.figure(figsize=(5,1.6))
+    sns.histplot(orig, stat="percent", bins=30, color="gray", alpha=0.7, label="Original")
+    sns.histplot(cyc_df["speed_kmh"], stat="percent", bins=30, color="C0", alpha=0.6, label="Cycle")
+    plt.xlabel("Speed (km/h)", fontweight="bold"); plt.ylabel("Percent", fontweight="bold")
+    plt.title(f"{label}", fontweight="bold")
+    plt.legend(); plt.tight_layout(); plt.show()
+
+for cls in ["HHD","MHD","LHD"]:
+    compare_speed_pdf(spd[cls], cyc[cls], cls)
