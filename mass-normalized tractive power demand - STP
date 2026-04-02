@@ -1,0 +1,197 @@
+# --- pip installs (run once in Colab/terminal) ---
+# !pip install pandas numpy matplotlib statsmodels scipy
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Optional smoothing: LOWESS (best for ragged data). Falls back to Savitzky–Golay if wanted.
+from statsmodels.nonparametric.smoothers_lowess import lowess
+from scipy.signal import savgol_filter
+
+import pandas as pd
+import gspread
+from google.colab import auth
+from google.auth import default
+from gspread_dataframe import get_as_dataframe
+
+# Authenticate Google account
+auth.authenticate_user()
+creds, _ = default()
+gc = gspread.authorize(creds)
+
+spreadsheet = gc.open_by_url(sheet_url)
+worksheet = gc.open("STP").sheet1  # opens first sheet
+
+# Convert worksheet to pandas DataFrame
+df = get_as_dataframe(worksheet)
+
+# ====== CONFIG ======
+SPEED_UNIT = "mph"   # one of: "mps" (m/s), "kph" (km/h), "mph"
+# ====================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# (Optional) ensure the exact column order/names exist
+expected_cols = [
+ 'STP_H','Speed_H','CO_H','CO2_H','HC_H','NO_H','HCNO_H',
+ 'STP_M','Speed_M','CO_M','CO2_M','HC_M','NO_M','HCNO_M',
+ 'STP_L','Speed_L','CO_L','CO2_L','HC_L','NO_L','HCNO_L'
+]
+missing = [c for c in expected_cols if c not in df.columns]
+assert not missing, f"Missing columns: {missing}"
+
+def to_mph(x, unit):
+    if unit == "mph": return x
+    if unit == "kph": return x * 0.621371
+    if unit == "mps": return x * 2.23694
+    raise ValueError("SPEED_UNIT must be one of: 'mps','kph','mph'")
+
+# convert each Speed_* to mph (MOVES table uses mph)
+for tag in ["H","M","L"]:
+    df[f"Speed_{tag}_mph"] = to_mph(df[f"Speed_{tag}"], SPEED_UNIT)
+
+def classify_opmode(stp, v_mph):
+    # 1) Idle
+    if v_mph < 1.0:
+        return 1
+
+    # 2) Coast (v in [1,25) or [25,50), or v >= 50 special)
+    if 1.0 <= v_mph < 25 and stp < 0:  return 11
+    if 25.0 <= v_mph < 50 and stp < 0: return 21
+    if v_mph >= 50 and stp < 6:        return 33
+
+    # 3) Cruise/Accel by speed band
+    if 1.0 <= v_mph < 25:
+        if 0 <= stp < 3:   return 12
+        if 3 <= stp < 6:   return 13
+        if 6 <= stp < 9:   return 14
+        if 9 <= stp < 12:  return 15
+        if stp >= 12:      return 16
+
+    if 25.0 <= v_mph < 50:
+        if 0 <= stp < 3:   return 22
+        if 3 <= stp < 6:   return 23
+        if 6 <= stp < 9:   return 24
+        if 9 <= stp < 12:  return 25
+        if 12 <= stp < 18: return 27
+        if 18 <= stp < 24: return 28
+        if 24 <= stp < 30: return 29
+        if stp >= 30:      return 30
+
+    if v_mph >= 50:
+        if 6  <= stp < 12: return 35
+        if 12 <= stp < 18: return 37
+        if 18 <= stp < 24: return 38
+        if 24 <= stp < 30: return 39
+        if stp >= 30:      return 40
+
+    # 0 = Decel/Braking (fallback)
+    return 0
+
+# compute OpMode for each class
+for tag in ["H","M","L"]:
+    df[f"OpMode_{tag}"] = [
+        classify_opmode(stp, v)
+        for stp, v in zip(df[f"STP_{tag}"], df[f"Speed_{tag}_mph"])
+    ]
+
+# wide -> long for STP, Speed, emissions, OpMode
+records = []
+for tag in ["H","M","L"]:
+    sub = df[[f"STP_{tag}", f"Speed_{tag}_mph",
+              f"CO_{tag}", f"CO2_{tag}", f"HC_{tag}", f"NO_{tag}", f"HCNO_{tag}",
+              f"OpMode_{tag}"]].copy()
+    sub.columns = ["STP","Speed_mph","CO","CO2","HC","NO","HCNO","OpMode"]
+    sub["Class"] = {"H":"Heavy","M":"Medium","L":"Low"}[tag]
+    records.append(sub)
+
+long = pd.concat(records, ignore_index=True)
+long.head()
+
+# Save with classification results
+output_file = "classified_opmodes.csv"
+df.to_csv(output_file, index=False)
+
+# Download to your computer
+from google.colab import files
+files.download(output_file)
+
+records = []
+
+for tag, cname in zip(["H","M","L"], ["Heavy","Medium","Low"]):
+    sub = df[[f"OpMode_{tag}", f"STP_{tag}", f"Speed_{tag}",
+              f"CO_{tag}", f"CO2_{tag}", f"HC_{tag}", f"NO_{tag}", f"HCNO_{tag}"]].copy()
+
+    sub.columns = ["OpMode","STP","Speed","CO","CO2","HC","NO","HCNO"]  # reset column names
+    sub["Class"] = cname  # add the Class column fresh
+
+    records.append(sub)
+
+long = pd.concat(records, ignore_index=True)
+
+# Save with classification results
+output_file = "classified_opmodes.csv"
+df.to_csv(output_file, index=False)
+
+import pandas as pd
+
+
+# 1) Your OpMode classifier (speed in mph directly)
+def classify_opmode(stp, v_mph):
+    # Idle
+    if v_mph < 1.0:
+        return 1
+
+    # Coast
+    if 1.0 <= v_mph < 15 and stp < 0:  return 11
+    if 15.0 <= v_mph < 50 and stp < 0: return 21
+    if v_mph >= 50 and stp < 6:        return 33
+
+    # Cruise/Acceleration
+    if 1.0 <= v_mph < 15:
+        if 0 <= stp < 3:   return 12
+        if 3 <= stp < 6:   return 13
+        if 6 <= stp < 9:   return 14
+        if 9 <= stp < 12:  return 15
+        if stp >= 12:      return 16
+
+    if 15.0 <= v_mph < 50:
+        if 0 <= stp < 3:   return 22
+        if 3 <= stp < 6:   return 23
+        if 6 <= stp < 9:   return 24
+        if 9 <= stp < 12:  return 25
+        if 12 <= stp < 18: return 27
+        if 18 <= stp < 24: return 28
+        if 24 <= stp < 30: return 29
+        if stp >= 30:      return 30
+
+    if v_mph >= 50:
+        if 6  <= stp < 12: return 35
+        if 12 <= stp < 18: return 37
+        if 18 <= stp < 24: return 38
+        if 24 <= stp < 30: return 39
+        if stp >= 30:      return 40
+
+    # Decel/Braking fallback
+    return 0
+
+# 2) Apply to every row
+df["OpMode_calc"] = [classify_opmode(stp, v) for stp, v in zip(df["STP"], df["SPEED"])]
+
+# 3) Check mismatch with existing OPMODE (if present)
+if "OPMODE" in df.columns:
+    df["OpMode_match"] = (df["OpMode_calc"] == df["OPMODE"])
+    mismatch_rate = 100 * (1 - df["OpMode_match"].mean())
+    print(f"Overall mismatch: {mismatch_rate:.2f}%")
+
+# 4) Save results
+df.to_csv("opmode_classified.csv", index=False)
+print("Saved classified dataset as opmode_classified.csv")
+
+# Download to your computer
+from google.colab import files
+files.download(output_file)
